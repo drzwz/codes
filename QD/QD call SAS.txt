@@ -1,0 +1,332 @@
+//引用等略
+public class MyATS : ATSCrossComponent
+{
+
+
+////================第0部分：设置变量
+
+
+
+    //注:先引用有关类:System.Data,System.Xml,SAS IOM,SASObjectManager!!!
+    //  1)Tools=>Configuration=>References=>GlobalAssemblyCache,添加System.Data、System.Xml、System.Windows.Forms、System.Design
+    //  2)Tools=>Configuration=>References=>UserDefined,添加Interop.SAS和Interop.SASObjectManager
+    //SAS:定义SAS对象、ADO.net对象
+    SASObjectManager.ObjectFactoryClass sasOF = null;
+    SASObjectManager.ServerDefClass sasSD = null;
+    SAS.Workspace sasWS = null;
+    SASObjectManager.ObjectKeeperClass sasOK = null;
+    SAS.LanguageService sasLS = null;
+    OleDbConnection cn = null;
+    OleDbCommand cmd = null;
+    //定义变量/属性
+    string sasLibname = @"libname mylib 'd:\fe\sas\datainmem\' ;";
+    [Category("参数"), Description("建立SAS逻辑库的命令，建议交易时加选项MEMLIB，测试时不加便于跟踪数据")]
+    public string SASLibname
+    {
+        get { return sasLibname; }
+        set { sasLibname = value; }
+    }
+    string sasPath = @"D:\QuantDeveloper\solutions\IFArbitrage\";
+    [Category("参数"), Description("SAS程序文件目录；可以浏览选择。"),
+        Editor(typeof(System.Windows.Forms.Design.FileNameEditor), typeof(System.Drawing.Design.UITypeEditor))]
+    public string SASPath
+    {
+        get { return sasPath; }
+        set { sasPath = value; }
+    }
+    string sasFile1 = @"sasforqd1.sas";
+    [Category("参数"), Description("SAS程序，用于建模。")]
+    public string SASFile1
+    {
+        get { return sasFile1; }
+        set { sasFile1 = value; }
+    }
+    string sasFile2 = @"sasforqd2.sas";
+    [Category("参数"), Description("SAS程序，用于判断是否交易。")]
+    public string SASFile2
+    {
+        get { return sasFile2; }
+        set { sasFile2 = value; }
+    }
+    int barsForModel = 600;
+    [Category("参数"), Description("用于建模的Bar数目。")]
+    public int BarsForModel
+    {
+        get { return barsForModel; }
+        set { barsForModel = value; }
+    }
+    int barsForTrade = 100;
+    [Category("参数"), Description("用于交易的Bar数目。")]
+    public int BarsForTrade
+    {
+        get { return barsForTrade; }
+        set { barsForTrade = value; }
+    }
+    string sym1 = @"IF1005";
+    [Category("参数"), Description("品种1；建模时作为因变量，与交易方向有关，不可弄错。")]
+    public string Symbol1
+    {
+        get { return sym1; }
+        set { sym1 = value; }
+    }
+    string sym2 = @"IF1006";
+    [Category("参数"), Description("品种2；建模时作为自变量，与交易方向有关，不可弄错。")]
+    public string Symbol2
+    {
+        get { return sym2; }
+        set { sym2 = value; }
+    }
+
+    //状态
+    string current = ""; //保存当前bar's begintime === 
+    DateTime curDT = DateTime.Now;
+    int barsCurrent = 0;  //截止当前的bar数   
+    int barsTradable = 0; //tradable时段的bar数
+    bool tradable = false; //是否处于可交易时段
+    SingleOrder order = null;
+    Instrument inst1 = null;
+    Instrument inst2 = null;
+
+
+	
+////================第1部分：策略初始化
+
+
+
+    public override void Init()
+    {
+        Console.WriteLine("Strategy Init...");
+        //判断Market里指定的Instrument与sym1、sym2是否匹配。
+        if (!this.Strategy.MarketManager.Instruments.Contains(sym1) ||
+            !this.Strategy.MarketManager.Instruments.Contains(sym2))
+        {
+            throw new Exception("错误：你添加的Instrument不匹配！");
+        }
+        //SAS:创建SAS相关对象：OF SD WS OK
+        sasOF = new SASObjectManager.ObjectFactoryClass();
+        sasSD = new SASObjectManager.ServerDefClass();
+        sasSD.MachineDNSName = "localhost";
+        sasSD.Protocol = SASObjectManager.Protocols.ProtocolCom;
+        sasWS = (SAS.Workspace)sasOF.CreateObjectByServer("", true, sasSD, null, null);
+        sasOK = new SASObjectManager.ObjectKeeperClass();
+        sasOK.AddObject(1, "mySAS", sasWS);
+        sasLS = sasWS.LanguageService;
+        sasLS.Async = false;
+        sasLS.StoredProcessService.Repository = @"file:" + sasPath;
+        sasLS.StepError += new SAS.CILanguageEvents_StepErrorEventHandler(this.OnSASStepError);
+
+        //SAS:创建ado.net相关对象
+        //cn = new OleDbConnection("Provider=sas.IOMProvider.1; Data Source=_LOCAL_");
+        cn = new OleDbConnection("Provider=sas.IOMProvider.1;SAS Workspace ID=" + sasWS.UniqueIdentifier + ";");
+        cn.Open();
+        cmd = cn.CreateCommand();
+        cmd.CommandType = CommandType.Text;
+        //创建instrument对象
+        inst1 = InstrumentManager.Instruments[sym1];
+        inst2 = InstrumentManager.Instruments[sym2];
+        //SAS:建立SAS逻辑库、建立数据表并导入历史数据
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine(sasLibname);//建立逻辑库
+        sb.AppendLine(@"data mylib.data_fromqd;");
+        sb.AppendLine(@"  format sym $20. dt datetime. close;input @1 sym dt close;");//字段：代码、时间、最新价
+        sb.AppendLine(@"datalines;");
+        //   将历史数据传给SAS
+        foreach (Instrument inst in this.Strategy.MarketManager.Instruments)
+        {
+            IDataSeries dataSeries = DataManager.GetDataSeries(inst, "Bar.Time.60");//<==========注意这里指定了周期，若周期不同需要修改
+
+            if (dataSeries.Count < barsForModel)
+            {
+                throw new Exception("错误：数据不足，请先导入数据！");
+            }
+            if (this.Strategy.MetaStrategyBase.MetaStrategyMode == MetaStrategyMode.Simulation)
+            {//测试状态下，将两个品种序列的所有数据传到SAS，测试过程中无须再次传输数据
+                for (int i = 0; i < dataSeries.Count; i++)
+                {
+                    Bar bar = dataSeries[i] as Bar;
+                    sb.AppendLine(string.Format("{0} {1} {2}", inst.Symbol, sasSecondsDiff(bar.BeginTime), bar.Close));
+                }
+            }
+            else//交易状态下，仅传模型中需要的最新barsForModel个数据，新到数据在OnBar中传给SAS
+            {
+                for (int i = dataSeries.Count - barsForModel; i < dataSeries.Count; i++)
+                {
+                    Bar bar = dataSeries[i] as Bar;
+                    sb.AppendLine(string.Format("{0} {1} {2}", inst.Symbol, sasSecondsDiff(bar.BeginTime), bar.Close));
+                }
+            }
+        }
+        sb.AppendLine(@";");
+        sb.AppendLine(@"run;");
+		//SAS:运行上面生成的SAS命令
+        sasLS.Submit(sb.ToString());//运行上面生成的SAS命令
+
+        //Console.WriteLine(sb.ToString());
+    }
+
+
+
+
+////================第2部分：当每一合约的K线生成后，就将数据传给SAS
+
+    public override void OnBar(Instrument instrument, Bar bar)
+    {
+        barsCurrent = Bars[instrument].Count;
+        curDT = bar.BeginTime;
+        //Console.WriteLine("OnBar...{0} {1}",barsCurrent,bar.BeginTime );
+        current = sasSecondsDiff(bar.BeginTime);
+        if (this.Strategy.MetaStrategyBase.MetaStrategyMode == MetaStrategyMode.Simulation)
+        {   //测试状态下
+            if (barsCurrent < barsForModel) return;
+        }
+        else
+        {   //交易状态下,将最新数据插入数据库(时间为BeginTime);测试时数据已一次性传给SAS，无须更新。
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine(@"data mylib.data_new;");
+            sb.AppendLine(@"  format sym $20. dt datetime. close;input @1 sym dt close;");
+            sb.AppendLine(@"datalines;");
+            sb.AppendLine(string.Format("{0} {1} {2}", instrument.Symbol, current, bar.Close));
+            sb.AppendLine(@";");
+            sb.AppendLine(@"run;");
+            sb.AppendLine(@"proc append base=mylib.data_fromqd data=mylib.data_new;run;quit;");
+			//SAS:
+            sasLS.Submit(sb.ToString());
+        }
+    }
+
+////================第3部分：所有K线生成完成，运行SAS策略程序，然后将SAS运行结果取回
+
+	
+    public override void OnBarSlice(long barSize)
+    {
+        //Console.WriteLine("OnBarSlice...{0}",current );
+        if (this.Strategy.MetaStrategyBase.MetaStrategyMode == MetaStrategyMode.Simulation)
+        {
+            if (barsCurrent < barsForModel) return;
+        }
+        if (tradable == false)
+        {
+            //运行sasforqd1
+            string args = string.Format("barsForModel={0} barsForTrade={1} sym1={2} sym2={3} current={4}", barsForModel, barsForTrade, sym1, sym2, current);
+			//SAS:运行SAS策略程序
+            sasLS.StoredProcessService.Execute("sasforqd1", args);
+            //Console.WriteLine("{0} {1}",curDT,"sasforqd1");
+            //SAS:取回运行结果
+            cmd.CommandText = @"select result1,inter,beta from mylib.data_result1";
+            OleDbDataReader reader = cmd.ExecuteReader();
+            int result1 = 0;
+            tradable = false;
+            barsTradable = 0;
+            if (reader.Read())
+            {
+                result1 = Convert.ToInt32(reader.GetValue(0));
+                if (result1 == 1)
+                {
+                    tradable = true;
+                    Console.WriteLine("tradable:{0} {1} {2} {3} {4}", current, curDT, Convert.ToString(reader.GetValue(0)), Convert.ToString(reader.GetValue(1)), Convert.ToString(reader.GetValue(2)));
+                }
+            }
+            reader.Close();
+        }
+        else
+        {//可交易时段；判断是否下单
+            barsTradable += 1;
+            if (barsTradable <= barsForTrade)
+            {
+                //SAS:运行sasforqd2
+                string args = string.Format("barsForModel={0} barsForTrade={1} sym1={2} sym2={3} current={4}", barsForModel, barsForTrade, sym1, sym2, current);
+                sasLS.StoredProcessService.Execute("sasforqd2", args);
+                //Console.WriteLine("{0} {1}",curDT,"sasforqd2");
+                //SAS:取回运行结果
+                cmd.CommandText = @"select result2 from mylib.data_result2";
+                OleDbDataReader reader = cmd.ExecuteReader();
+                int result2 = 0;
+
+                if (reader.Read())
+                {
+                    result2 = Convert.ToInt32(reader.GetValue(0));
+                    if (result2 == 1)
+                    {
+                        if (Portfolio.Positions[sym1] == null || Portfolio.Positions[sym2] == null)
+                        {
+                            order = MarketOrder(inst1, Side.Sell, 1);
+                            order.Send();
+                            order = MarketOrder(inst2, Side.Buy, 1);
+                            order.Send();
+                        }
+                    }
+                    if (result2 == 2)
+                    {
+                        if (Portfolio.Positions[sym1] == null || Portfolio.Positions[sym2] == null)
+                        {
+                            order = MarketOrder(inst1, Side.Buy, 1);
+                            order.Send();
+                            order = MarketOrder(inst2, Side.Sell, 1);
+                            order.Send();
+                        }
+                    }
+                    if (result2 == -1)
+                    {
+                        if (Portfolio.Positions[sym1] != null)
+                        {
+                            order = MarketOrder(inst1, Side.Buy, 1);
+                            order.Send();
+                        }
+                        if (Portfolio.Positions[sym2] != null)
+                        {
+                            order = MarketOrder(inst2, Side.Sell, 1);
+                            order.Send();
+                        }
+                        tradable = false;
+                    }
+                    if (result2 == -2)
+                    {
+                        if (Portfolio.Positions[sym1] != null)
+                        {
+                            order = MarketOrder(inst1, Side.Sell, 1);
+                            order.Send();
+                        }
+                        if (Portfolio.Positions[sym2] != null)
+                        {
+                            order = MarketOrder(inst2, Side.Buy, 1);
+                            order.Send();
+                        }
+                        tradable = false;
+                    }
+                }
+                reader.Close();
+            }
+        }
+        if (barsTradable > barsForTrade) tradable = false;
+    }
+	
+////================第4部分：策略结束时 ， 关闭 SAS等。
+
+    public override void OnStrategyStop()
+    {
+        Console.WriteLine("Strategy Stopped!");
+        cn.Close();
+		//SAS:
+        sasOK.RemoveObject(sasWS);//...............
+        sasWS.Close();
+    }
+
+////================第5部分：相关函数
+    public void OnSASStepError()
+    {
+        //string msg=sasLS.FlushLog(1000);
+        Console.WriteLine("SAS出现错误，策略暂停运行（您可以选择继续或停止）。若SAS LOG已重定向，请检查相应的LOG文件.");
+        this.Strategy.ATSMetaStrategy.Pause();
+    }
+    /// <summary>
+    /// C#时间转换为SAS时间对应的数值的字符串
+    /// </summary>
+    private string sasSecondsDiff(DateTime DateTime1)
+    {
+        TimeSpan ts1 = new TimeSpan(DateTime1.Ticks);
+        TimeSpan ts2 = new TimeSpan((new DateTime(1960, 1, 1, 0, 0, 0)).Ticks);
+        TimeSpan ts = ts1.Subtract(ts2).Duration();
+        return ts.TotalSeconds.ToString();//"秒";  
+    }
+}
