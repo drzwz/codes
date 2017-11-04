@@ -1,4 +1,5 @@
 \d .zz
+httpget:{[host;location] r:(`$":http://",host)"GET ",location," HTTP/1.1\r\nHost:",host,"\r\n\r\n";i:first r ss "\r\n\r\n";(i+4) _ r}; 
 //=============================从新浪读行情=============================
 /从新浪读行情，返回taq表: .zz.getsinataq[`600036.SH]
 getsinataq:{[fesym]:$[fesym like "*.S[HZ]";.zz.getsinacstaq fesym;
